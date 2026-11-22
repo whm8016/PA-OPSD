@@ -49,13 +49,18 @@ def weight_precision(precision, is_adapter):
 
 
 def save_training_metadata(options, precision, rows, metrics, *, standard_solution_context=None,
-                           rollout_validation=None):
+                           rollout_validation=None, optimizer_log=None):
     summary = {'stage': 'opsd', 'rows': rows, 'model': str(options.sft_checkpoint),
                'load_in_4bit': options.load_in_4bit, 'precision': precision,
                'max_length': options.max_length, 'max_completion_length': options.max_completion_length,
                'metrics': metrics, 'source_sha256': sha256(Path(__file__).read_bytes()).hexdigest(),
                'data_sha256': sha256(Path(options.train_jsonl).read_bytes()).hexdigest(),
                'teacher_mode': options.teacher_mode}
+    for field in ('learning_rate', 'seed'):
+        if hasattr(options, field):
+            summary[field] = getattr(options, field)
+    if optimizer_log is not None:
+        summary['optimizer_log'] = optimizer_log
     if standard_solution_context is not None:
         summary['teacher_context'] = standard_solution_context
     if rollout_validation is not None:
@@ -97,6 +102,8 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
     if gold_run:
         parser.add_argument('--standard-solution-bank', type=Path,
                             help='Use only the current problem answer and analysis from the official XES3G5M bank')
+        parser.add_argument('--solution-only-addendum', action='store_true',
+                            help='Append only the standard solution, without teacher-specific instructions')
     options = parser.parse_args(argv)
     if options.checkpoint_steps is not None and options.checkpoint_steps < 1:
         parser.error('--checkpoint-steps must be positive')
@@ -105,6 +112,9 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
 
     (validate_manifest or validate_against_seed_manifest)(rows, options.seed_manifest)
     bank = options.standard_solution_bank if gold_run else None
+    solution_only = gold_run and options.solution_only_addendum
+    if solution_only and bank is None:
+        parser.error('--solution-only-addendum requires --standard-solution-bank')
     solutions, bank_hash = None, None
     if bank is not None:
         from pa_opsd_collator import load_standard_solutions
@@ -138,6 +148,8 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
             "mode": "standard_solution", "question_bank_sha256": bank_hash,
             "initial_adapter_sha256": sha256(anchor_weights.read_bytes()).hexdigest(),
         }
+        if solution_only:
+            solution_context["addendum"] = "solution_only"
     if options.max_steps < 1 or options.batch_size < 1 or options.gradient_accumulation_steps < 1:
         raise ValueError("Training steps and batch/accumulation sizes must be positive")
     try:
@@ -174,7 +186,8 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     collator = PAOPSDDataCollator(tokenizer, options.max_length, options.max_completion_length,
-                                   standard_solutions=solutions, strict_output_prompt=options.strict_output_prompt)
+                                 standard_solutions=solutions, strict_output_prompt=options.strict_output_prompt,
+                                 standard_solution_guidance=not solution_only)
     # Check every prompt budget before starting any optimizer step.
     for row in rows:
         for messages in collator.prompt_messages(row):
@@ -267,12 +280,14 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
         solution_context["optimizer_steps"] = effective_steps
     if effective_steps == 0 and rollout_validation is not None:
         save_training_metadata(options, precision, len(rows), result.metrics,
-                               standard_solution_context=solution_context, rollout_validation=rollout_validation)
+                               standard_solution_context=solution_context, rollout_validation=rollout_validation,
+                               optimizer_log=trainer.state.log_history)
         raise RuntimeError("No valid PA-OPSD rollouts reached an optimizer update")
     trainer.save_model(options.output_dir)
     tokenizer.save_pretrained(options.output_dir)
     save_training_metadata(options, precision, len(rows), result.metrics,
-                           standard_solution_context=solution_context, rollout_validation=rollout_validation)
+                           standard_solution_context=solution_context, rollout_validation=rollout_validation,
+                           optimizer_log=trainer.state.log_history)
 
 
 if __name__ == "__main__":

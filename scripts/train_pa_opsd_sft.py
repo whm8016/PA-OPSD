@@ -225,9 +225,13 @@ def train(args, tokenizer, features):
     from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
 
     class AssistantOnlyTrainer(Trainer):
+        supervised_tokens_seen = 0
+
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             loss, outputs = assistant_token_loss(model, inputs, num_items_in_batch,
                                                  offload_saved_tensors=args.offload_saved_tensors)
+            if model.training:
+                self.supervised_tokens_seen += inputs["labels"][:, 1:].ne(-100).sum().item()
             return (loss, outputs) if return_outputs else loss
 
     torch.manual_seed(args.seed)
@@ -289,6 +293,8 @@ def train(args, tokenizer, features):
     tokenizer.save_pretrained(args.output_dir)
     summary = {"model": args.model, "rows": len(features), "max_length": args.max_length,
                "init_adapter": args.init_adapter, "seed": args.seed,
+               "learning_rate": args.learning_rate, "optimizer_steps": result.global_step,
+               "optimizer_log": trainer.state.log_history,
                'optimizer_restarted': bool(args.init_adapter),
                'supervised_tokens_in_dataset': sum(sum(t != -100 for t in f['labels']) for f in features),
                'lora_r': model.peft_config['default'].r,
@@ -296,6 +302,8 @@ def train(args, tokenizer, features):
                "assistant_logits_only": args.assistant_logits_only,
                "offload_saved_tensors": args.offload_saved_tensors, "metrics": result.metrics,
                "peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None}
+    if args.assistant_logits_only:
+        summary["supervised_tokens_seen"] = trainer.supervised_tokens_seen
     from hashlib import sha256
 
     summary['source_sha256'] = sha256(Path(__file__).read_bytes()).hexdigest()
