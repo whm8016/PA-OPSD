@@ -1,0 +1,51 @@
+# Gold evidence-first 对照
+
+这个入口验证三个问题：在 SFT 目标中先输出历史答案是否改善诊断，标准解能否提供诊断监督，以及续训学习率和 OPSD 是否带来可复现的收益。原 Gold 数据和检查点继续用于历史复核。
+
+| 阶段 | 数据和口径 |
+| --- | --- |
+| SFT 顺序对照 | 两组用同样的 420 条、同样的输入、相同初始 LoRA 种子及 `2e-5`。旧序 `diagnosis, reason, strategy, content, memory`，新序 `memory, diagnosis, reason, strategy, content`。两组都用同一份显式、合法的 LongTutor JSON 提示。 |
+| 教师预检 | 同一 SFT 权重在同一批 140 道开发题上生成两份输出。教师用与 OPSD 训练一致的标准解追加段，学生用普通提示，Gold 参考只进入评分。诊断答对数和四类 Macro-F1 都提升才通过试验前筛选。 |
+| 学习率与蒸馏 | 第二阶段仅用另留的 140 条。SFT 续训和 OPSD 从同一 SFT 适配器开始，使用同样的样本和累积配置。可用 `--steps` 固定更短的预算对照 `1e-6`、`5e-6`、`2e-5`。正式比较需要相同学习率与有效更新步数。 |
+
+划分对学生、当前题 ID、归一题干和历史文本指纹分组。独立二阶段保证该阶段的当前题不在 SFT 中担任当前题或监督目标，题目仍可能在其他学生的历史记录中出现。原 140 道开发题保持原样本清单。只读取原 `development/` 下三个文件，不读取封存题。入口校验原始文件哈希、再校验派生包、目标序列、样本交集、教师输入边界及二阶段检查点归属。实际训练前可在 CPU 上检查保存的真实 tokenizer。
+
+在工作区根目录准备输入和 AutoDL 包。
+
+```text
+python -m scripts.experiments.gold_evidence_first.run --bundle outputs/pa_opsd/gold_evidence_first/inputs_v1 prepare
+python -m scripts.experiments.gold_evidence_first.run --bundle outputs/pa_opsd/gold_evidence_first/inputs_v1 check --tokenizer /path/to/qwen-tokenizer
+python -m scripts.experiments.gold_evidence_first.run --bundle outputs/pa_opsd/gold_evidence_first/inputs_v1 pack --output outputs/pa_opsd/gold_evidence_first/gpu_v1.zip
+```
+
+归档包包含开发数据和引用，单独上传到授权的训练机。GitHub 只同步代码、公开构造的例子和测试。解压后从包根目录运行以下命令。使用已装好项目依赖的 AutoDL 环境，另外需要上游校验依赖 `openai`、`tqdm`。运行前按包内 `base_model.json` 核对 Qwen2.5-7B-Instruct 权重和配置。
+
+```bash
+MODEL=/path/to/Qwen2.5-7B-Instruct
+gold() { python -m scripts.experiments.gold_evidence_first.run --bundle inputs "$@"; }
+
+gold check --tokenizer "$MODEL"
+gold train memory_first --model "$MODEL" --pin base_model.json --output runs/smoke --smoke
+gold train legacy --model "$MODEL" --pin base_model.json --output runs/legacy
+gold train memory_first --model "$MODEL" --pin base_model.json --output runs/memory_first
+
+gold evaluate --model "$MODEL" --pin base_model.json --output runs/base_eval
+gold evaluate --model "$MODEL" --pin base_model.json --checkpoint runs/legacy --output runs/legacy_eval
+gold evaluate --model "$MODEL" --pin base_model.json --checkpoint runs/memory_first --output runs/memory_eval
+gold compare runs/legacy_eval runs/memory_eval --output runs/order_comparison.json
+
+# 根据开发集结果选择 SFT 起点。这里以 memory_first 为例。
+ANCHOR=runs/memory_first
+gold evaluate --model "$MODEL" --pin base_model.json --checkpoint "$ANCHOR" --teacher-pair --output runs/teacher_probe
+
+gold train sft_cont --model "$MODEL" --pin base_model.json --anchor "$ANCHOR" --learning-rate 5e-6 --steps 8 --output runs/cont_screen_5e6
+gold train opsd --model "$MODEL" --pin base_model.json --anchor "$ANCHOR" --learning-rate 5e-6 --steps 8 --teacher-report runs/teacher_probe/report.json --output runs/opsd_screen_5e6
+```
+
+学习率筛查结束后，用相同入选学习率、不带 `--steps` 训练两组，再分别 `evaluate`、`compare`。每次使用新目录。默认批大小 1、累积 4，SFT 105 步，第二阶段 35 个尝试窗口。OPSD 跳过整窗无有效 JSON 的更新，因此不足 35 实际步时保留诊断结果并阻止按同预算汇总。带 `--smoke` 的适配器只用于工程验证。
+
+训练目录保存真实命令、代码与数据哈希、软件版本、原始日志、学习率和梯度、有效步数、计入损失的 token 及前后权重变化。评测目录保存逐题原文及终止原因、四类诊断及召回、策略匹配、Q1–Q3 精确匹配和反馈字符重合。这里是同一入口的离线对照。正式教学质量仍需复用 LongTutor 裁判协议另评。
+
+## 一条虚构样例
+
+学生可见输入是“上周做对两道通分题。今天把分母改成 12，分子忘了乘。请回答三道历史问题并给出诊断和提示”。教师额外看到“这道题的标准解需要分子、分母同乘 3”，历史和问题保持相同。SFT 目标先回答 `memory`，再写 `diagnosis`、`reason`、`strategy` 和 `content`。SFT 只在助手答案 token 上计算损失。OPSD 先由学生生成回答，教师在保留相同生成前缀的情况下提供分布监督。

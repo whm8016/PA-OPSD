@@ -1497,6 +1497,9 @@ class OPSDTrainer(SFTTrainer):
                         inputs, generated_ids, eos_token_id, self.processing_class, retry
                     )
                     gate.stats.update(f"attempt_{row['attempt']}_{row['status']}" for row in attempts)
+                    gate.stats["accepted_completion_tokens"] += sum(
+                        row["completion_tokens"] for row in attempts if row["status"] == "valid"
+                    )
                     gate.initial_sample_ids.update(row["sample_id"] for row in attempts if row["attempt"] == 1)
                     skipped = [row["sample_id"] for row in attempts
                                if row["attempt"] == 2 and row["status"] != "valid"]
