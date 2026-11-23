@@ -326,3 +326,7 @@ If you find this useful, please consider citing:
   year={2026}
 }
 ```
+
+## 最新官方评测
+
+[LongTutor 基座与新顺序 SFT 复评结果](docs/LongTutor官方复评_基座与SFT.md)包含固定开发集 140 道的指标与评测设置。

@@ -1,5 +1,32 @@
 # LongTutor Gold 140 复评
 
+## 新顺序 SFT 正式复评
+
+使用 `outputs/pa_opsd/longtutor_reeval_gold140/official_base_vs_memory_first_20261123/official_eval_gpu.zip`。包内包含固定开发集 140 道、官方 Gold、从此前 1,000 条官方推理结果提取的同题基座预测，以及训练 105 步的新顺序 SFT 适配器。已核对两组使用的 140 道官方提示词哈希。基座预测复用原始逐题结果。官方脚本固定在 `ba40af3`，两组均使用该版本的原始评分入口。
+
+AutoDL 解压后，从包目录启用已有 vLLM 0.9.2 环境，使用 `base_model.json` 核验权重和 tokenizer。模型服务及 SFT 推理命令如下。先用独立输出文件加 `--limit 2` 试跑，确认后再运行全量。
+
+```bash
+vllm serve "$QWEN_MODEL" --served-model-name Qwen2.5-7B-Instruct \
+  --host 127.0.0.1 --port 8000 --dtype bfloat16 --max-model-len 32768 \
+  --max-num-seqs 4 --gpu-memory-utilization 0.91 --enable-lora --max-lora-rank 8 \
+  --lora-modules memory_first=adapters/memory_first
+```
+
+```bash
+PYTHONHASHSEED=0 OPENAI_API_KEY=EMPTY OPENAI_BASE_URL=http://127.0.0.1:8000/v1 \
+  python -u upstream/eval_ai_tutor.py --input inputs.jsonl --tests gold.jsonl \
+  --output sft.jsonl --model memory_first --temperature 0 --max_tokens 3000 --workers 4
+```
+
+取回 `sft.jsonl` 后，核对两组均覆盖同一 140 个 ID 并区分模型格式失败和服务故障。在本地配置 DK 的 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和模型 ID，分别对 `base.jsonl`、`sft.jsonl` 运行下列原始评分入口。使用不同的逐题评分文件及运行日志，核对实际完成条数和裁判错误后汇总。
+
+```text
+python -u upstream/compute_ai_tutor_eval_metrics.py --pred BASE_OR_SFT.jsonl --gold gold.jsonl --out ARM.metrics.jsonl --model DK_MODEL --temperature 0 --workers 4 --limit 140
+```
+
+## 历史 Gold SFT、续训和 OPSD 复评
+
 用固定的 140 条验证题，比较原始 Qwen2.5-7B-Instruct、Gold SFT、SFT 续训和 token 级 OPSD。两种续训各更新 35 步，复评直接加载保存的检查点。
 
 ## 本地准备
