@@ -8,14 +8,24 @@ import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from pa_opsd_contract import (
-    PROMPT_CONFIG,
-    XES,
-    fingerprint,
-    official_module,
-    read_jsonl,
-    validate_target,
-)
+if __package__:
+    from .pa_opsd_contract import (
+        PROMPT_CONFIG,
+        XES,
+        fingerprint,
+        official_module,
+        read_jsonl,
+        validate_target,
+    )
+else:
+    from pa_opsd_contract import (
+        PROMPT_CONFIG,
+        XES,
+        fingerprint,
+        official_module,
+        read_jsonl,
+        validate_target,
+    )
 
 SIZES = {"train": 560, "validation": 140, "test": 300}
 SEED = 42
@@ -99,16 +109,19 @@ def components(records):
     return list(groups.values())
 
 
-def stratified_split(records):
+def stratified_split(records, *, sizes=None):
     import numpy as np
     from scipy.optimize import Bounds, LinearConstraint, milp
 
+    sizes = SIZES if sizes is None else sizes
+    if not sizes or min(sizes.values()) < 1 or sum(sizes.values()) != len(records):
+        raise ValueError("Split sizes must be positive and cover all records")
     rng = random.Random(SEED)
     groups = components(records)
     diagnoses = sorted({row["target"]["diagnosis"] for row in records})
     profiles = [Counter(row["target"]["diagnosis"] for row in group) for group in groups]
     totals = Counter(row["target"]["diagnosis"] for row in records)
-    splits = tuple(SIZES)
+    splits = tuple(sizes)
     width = len(groups)
     n = width * len(splits)
     matrix = np.zeros((width + len(splits) * (1 + len(diagnoses)), n))
@@ -118,11 +131,11 @@ def stratified_split(records):
         cols = slice(j * width, (j + 1) * width)
         matrix[:width, cols] = np.eye(width)
         matrix[len(lower), cols] = [len(group) for group in groups]
-        lower.append(SIZES[split])
-        upper.append(SIZES[split])
+        lower.append(sizes[split])
+        upper.append(sizes[split])
         for diagnosis in diagnoses:
             matrix[len(lower), cols] = [profile[diagnosis] for profile in profiles]
-            desired = totals[diagnosis] * SIZES[split] / len(records)
+            desired = totals[diagnosis] * sizes[split] / len(records)
             lower.append(np.floor(desired))
             upper.append(np.ceil(desired))
     objective = [rng.random() for _ in range(n)]

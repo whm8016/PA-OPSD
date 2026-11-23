@@ -41,6 +41,21 @@ def load_standard_solutions(rows, question_bank):
     return {sample: solutions[qid] for sample, qid in current_questions.items()}
 
 
+def standard_solution_messages(student, reference, *, include_guidance=True):
+    teacher = [dict(message) for message in student]
+    teacher[1]["content"] += (
+        "\n\n### TEACHER-ONLY REFERENCE SOLUTION\n"
+        + json.dumps(reference, ensure_ascii=False, sort_keys=True)
+    )
+    if include_guidance:
+        teacher[1]["content"] += (
+            "\nUse the worked solution to understand the exercise. Base memory answers and diagnosis "
+            "on the student's records. Give an appropriate next hint without exposing the full solution. "
+            "Return the same requested JSON response."
+        )
+    return teacher
+
+
 def validate_distill_row(row):
     messages = row.get("messages", [])
     if len(messages) != 3 or [m.get("role") for m in messages] != ["system", "user", "assistant"]:
@@ -75,7 +90,7 @@ def validate_distill_row(row):
 
 class PAOPSDDataCollator:
     def __init__(self, tokenizer, max_length=2048, max_completion_length=256, reason_first=False, *,
-                 standard_solutions=None, strict_output_prompt=False):
+                 standard_solutions=None, strict_output_prompt=False, standard_solution_guidance=True):
         if reason_first:
             raise ValueError("PA-OPSD v1 supports reason_first=False only")
         if max_length <= max_completion_length or max_completion_length < 1:
@@ -86,6 +101,7 @@ class PAOPSDDataCollator:
         self.tokenizer.padding_side = "left"
         self.max_prompt_length = max_length - max_completion_length
         self.standard_solutions = standard_solutions
+        self.standard_solution_guidance = standard_solution_guidance
         self.strict_output_prompt = strict_output_prompt
 
     def prompt_messages(self, row):
@@ -97,15 +113,8 @@ class PAOPSDDataCollator:
             student = strict_output_messages(student)
         if self.standard_solutions is not None:
             reference = self.standard_solutions[row["sample_id"]]
-            teacher = [dict(message) for message in student]
-            teacher[1]["content"] += (
-                "\n\n### TEACHER-ONLY REFERENCE SOLUTION\n"
-                + json.dumps(reference, ensure_ascii=False, sort_keys=True)
-                + "\nUse the worked solution to understand the exercise. Base memory answers and diagnosis "
-                "on the student's records. Give an appropriate next hint without exposing the full solution. "
-                "Return the same requested JSON response."
-            )
-            return student, teacher
+            return student, standard_solution_messages(
+                student, reference, include_guidance=self.standard_solution_guidance)
         teacher = student + [{
             "role": "user",
             "content": "Teacher-only privileged context (not student-visible):\n"

@@ -9,8 +9,12 @@ from collections import Counter
 from hashlib import sha256
 from pathlib import Path
 
-from pa_opsd_contract import read_jsonl
-from train_pa_opsd_sft import encode_row, load_tokenizer, validate_native_output
+if __package__:
+    from .pa_opsd_contract import read_jsonl
+    from .train_pa_opsd_sft import encode_row, load_tokenizer, validate_native_output
+else:
+    from pa_opsd_contract import read_jsonl
+    from train_pa_opsd_sft import encode_row, load_tokenizer, validate_native_output
 
 ROOT = Path(__file__).resolve().parents[1]
 ARMS = ("base", "sft", "sft_cont", "pa_opsd")

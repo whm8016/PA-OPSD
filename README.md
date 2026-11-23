@@ -2,6 +2,8 @@
 
 ## 当前 PA-OPSD 项目入口
 
+新顺序 SFT 与基座对照的代码和运行说明见 [Gold evidence-first 实验](scripts/experiments/gold_evidence_first/README.md)。
+
 先看 [代码阅读与工作区规范](docs/代码阅读与工作区规范.md)，其中说明当前有效代码、LongTutor 复现结果和新增文件的放置方式。后续协作规范见 [AGENTS.md](AGENTS.md)。
 
 当前金标实验和代码阅读入口见 [代码阅读与工作区规范](docs/代码阅读与工作区规范.md)。历史导航副本已移入 `archive/`，源码以 `scripts/` 和根目录训练代码为准。
