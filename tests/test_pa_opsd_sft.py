@@ -319,6 +319,24 @@ class SFTTests(unittest.TestCase):
                 torch.testing.assert_close(p.grad, gradients[name], rtol=1e-4, atol=1e-6)
         scaled, _ = assistant_token_loss(model, inputs, num_items_in_batch=8)
         torch.testing.assert_close(scaled, selected / 2)
+        # A common-class row and a minority-class row share the same accumulation denominator.
+        weights = [0.5, 1.5]
+        from scripts.train_pa_opsd_sft import AssistantCollator
+
+        weighted = AssistantCollator(0)([
+            {**{key: value[i].tolist() for key, value in inputs.items()}, "sample_weight": weight}
+            for i, weight in enumerate(weights)
+        ])
+        model.zero_grad(set_to_none=True)
+        actual, _ = assistant_token_loss(model, weighted, num_items_in_batch=8)
+        actual.backward()
+        actual_grad = model.lm_head.weight.grad.clone()
+        model.zero_grad(set_to_none=True)
+        expected = sum(weight * model(**{key: value[i:i + 1] for key, value in inputs.items()}).loss
+                       * inputs["labels"][i, 1:].ne(-100).sum() for i, weight in enumerate(weights)) / 8
+        expected.backward()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, model.lm_head.weight.grad, rtol=1e-4, atol=1e-6)
         with self.assertRaisesRegex(ValueError, "supervised assistant"):
             assistant_token_loss(model, {**inputs, "labels": torch.full_like(inputs["labels"], -100)})
 

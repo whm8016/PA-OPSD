@@ -135,8 +135,12 @@ class AssistantCollator:
     def __call__(self, examples):
         import torch
 
-        return {key: torch.tensor(value, dtype=torch.long)
-                for key, value in pad_examples(examples, self.pad_token_id).items()}
+        batch = {key: torch.tensor(value, dtype=torch.long)
+                 for key, value in pad_examples(examples, self.pad_token_id).items()}
+        if "sample_weight" in examples[0]:
+            batch["sample_weight"] = torch.tensor([item["sample_weight"] for item in examples],
+                                                  dtype=torch.float32)
+        return batch
 
 
 def read_rows(path):
@@ -154,7 +158,7 @@ def read_rows(path):
     return rows
 
 
-def prepare_rows(rows, tokenizer, max_length, split="train", audit=False):
+def prepare_rows(rows, tokenizer, max_length, split="train", audit=False, *, class_weights=None):
     features = []
     report = {"total_rows": len(rows), "selected_rows": 0, "usable_rows": 0,
               "invalid_rows": 0, "overlength_rows": 0, "supervised_tokens": 0,
@@ -171,6 +175,11 @@ def prepare_rows(rows, tokenizer, max_length, split="train", audit=False):
             if row["split"] != split:
                 continue
             encoded = encode_row(row, tokenizer, max_length)
+            if class_weights is not None:
+                label = json.loads(row["messages"][-1]["content"])["diagnosis"]
+                if label not in class_weights:
+                    raise ValueError(f"missing SFT class weight for {label!r}")
+                encoded["sample_weight"] = class_weights[label]
         except (ValueError, TypeError) as exc:
             category = "overlength_rows" if isinstance(exc, OverlengthError) else "invalid_rows"
             report[category] += 1
@@ -213,8 +222,12 @@ def assistant_token_loss(model, inputs, num_items_in_batch=None, offload_saved_t
     with context:
         outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
                         logits_to_keep=positions, use_cache=False)
+    sample_weight = inputs.get("sample_weight")
     loss = F.cross_entropy(outputs.logits.float().reshape(-1, outputs.logits.shape[-1]),
-                           targets.reshape(-1), ignore_index=-100, reduction="sum")
+                           targets.reshape(-1), ignore_index=-100,
+                           reduction="none" if sample_weight is not None else "sum")
+    if sample_weight is not None:
+        loss = (loss.reshape_as(targets).sum(dim=1) * sample_weight).sum()
     denominator = targets.ne(-100).sum() if num_items_in_batch is None else num_items_in_batch
     return loss / denominator, outputs
 
@@ -275,16 +288,22 @@ def train(args, tokenizer, features):
             lora_dropout=0.05, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         ))
     model.config.use_cache = False
+    checkpointing = {"save_strategy": "no"}
+    if getattr(args, "checkpoint_steps", None) is not None:
+        checkpointing.update(save_strategy="steps", save_steps=args.checkpoint_steps, save_total_limit=2)
+    class_weights = getattr(args, "diagnosis_class_weights", None)
     trainer = (AssistantOnlyTrainer if args.assistant_logits_only else Trainer)(
         model=model,
         args=TrainingArguments(
             output_dir=args.output_dir, max_steps=args.max_steps,
             num_train_epochs=args.epochs, per_device_train_batch_size=args.batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            learning_rate=args.learning_rate, logging_steps=1, save_strategy="no",
+            learning_rate=args.learning_rate, logging_steps=1,
             report_to=[], seed=args.seed,
+            remove_unused_columns=class_weights is None,
             bf16=use_bf16, gradient_checkpointing=args.gradient_checkpointing,
             gradient_checkpointing_kwargs={"use_reentrant": False},
+            **checkpointing,
         ),
         train_dataset=features, data_collator=AssistantCollator(tokenizer.pad_token_id),
     )
@@ -304,6 +323,8 @@ def train(args, tokenizer, features):
                "peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None}
     if args.assistant_logits_only:
         summary["supervised_tokens_seen"] = trainer.supervised_tokens_seen
+    if class_weights is not None:
+        summary["diagnosis_class_weights"] = class_weights
     from hashlib import sha256
 
     summary['source_sha256'] = sha256(Path(__file__).read_bytes()).hexdigest()
@@ -502,11 +523,14 @@ def main(argv=None, *, validate_manifest=None, load_inference=None):
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--assistant-logits-only", action="store_true",
                         help="Compute vocabulary logits only at supervised positions; requires model logits_to_keep support")
+    parser.add_argument("--diagnosis-class-weights",
+                        help="JSON object mapping diagnosis labels to positive SFT sample loss weights")
     parser.add_argument("--offload-saved-tensors", action="store_true",
                         help="Store saved forward tensors on CPU; requires --assistant-logits-only")
     parser.add_argument("--attn-implementation", default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
     parser.add_argument("--adapter")
     parser.add_argument('--init-adapter', help='Initialize trainable LoRA from an existing adapter; fresh optimizer')
+    parser.add_argument('--checkpoint-steps', type=int, help='Save training state every N optimizer steps')
     parser.add_argument('--limit', type=int)
     parser.add_argument('--generation-summary')
     parser.add_argument('--strict-output-prompt', action='store_true',
@@ -515,6 +539,22 @@ def main(argv=None, *, validate_manifest=None, load_inference=None):
     parser.add_argument("--completion-no-repeat-ngram-size", type=int, default=0,
                         help="Block repeated n-grams in generated tokens only (0 disables the filter)")
     args = parser.parse_args(argv)
+    weights = None
+    if args.diagnosis_class_weights is not None:
+        if args.command not in {"train", "audit"} or not args.assistant_logits_only:
+            parser.error("--diagnosis-class-weights requires train or audit and --assistant-logits-only")
+        try:
+            weights = json.loads(args.diagnosis_class_weights)
+        except ValueError:
+            parser.error("--diagnosis-class-weights must be valid JSON")
+        if not isinstance(weights, dict) or not weights or any(
+            type(weight) not in (int, float) or not 1.17549435e-38 <= weight <= 3.40282346e38
+            for weight in weights.values()
+        ):
+            parser.error("--diagnosis-class-weights must map labels to positive normal float32 numbers")
+        args.diagnosis_class_weights = weights
+    if args.checkpoint_steps is not None and (args.command != "train" or args.checkpoint_steps < 1):
+        parser.error("--checkpoint-steps requires train and a positive interval")
     if args.strict_output_prompt and args.command != "generate":
         parser.error("--strict-output-prompt applies only to generate")
     args.split = args.split or ("validation" if args.command == "generate" else "train")
@@ -539,7 +579,7 @@ def main(argv=None, *, validate_manifest=None, load_inference=None):
         (validate_manifest or validate_against_seed_manifest)(rows, args.seed_manifest)
         tokenizer = load_tokenizer(args.model, args.local_files_only)
         features, report = prepare_rows(rows, tokenizer, args.max_length, args.split,
-                                        audit=args.command == "audit")
+                                        audit=args.command == "audit", class_weights=weights)
         print(json.dumps(report, ensure_ascii=False))
         if args.command == "audit":
             return 1 if report["invalid_rows"] or report['overlength_rows'] or not report["usable_rows"] else 0

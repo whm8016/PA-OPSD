@@ -4,7 +4,9 @@ import argparse
 import json
 import shutil
 import sys
+from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
+from math import sqrt
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -150,11 +152,21 @@ def longest_prompts(rows, model, count):
                   reverse=True)[:count]
 
 
+def diagnosis_class_balance(rows):
+    counts = Counter(assistant_target(row)["diagnosis"] for row in rows)
+    # Keep all examples, but interpolate between the empirical class prior and a uniform prior.
+    normalizer = len(rows) / sum(sqrt(count) for count in counts.values())
+    return {"method": "inverse_sqrt_frequency", "counts": dict(counts),
+            "weights": {label: normalizer / sqrt(count) for label, count in counts.items()}}
+
+
 def command_train(args, manifest_hash):
     import torch
     from transformers import set_seed
 
     first = args.arm in FIRST_ARMS
+    if args.balance_diagnosis_classes and args.arm != "memory_first":
+        raise ValueError("--balance-diagnosis-classes applies only to memory_first")
     if first and (args.anchor or args.learning_rate not in (None, 2e-5)):
         raise ValueError("Both SFT order arms start at the base and use 2e-5")
     if not first and not args.anchor:
@@ -175,6 +187,7 @@ def command_train(args, manifest_hash):
     verify_base(args.model, args.pin)
     full_path = args.bundle / TRAIN_FILES[args.arm if first else "stage2"][0]
     expected = read_jsonl(full_path)
+    class_balance = diagnosis_class_balance(expected) if args.balance_diagnosis_classes else None
     if args.smoke:
         if args.accumulation > len(expected):
             raise ValueError("Smoke accumulation exceeds the cohort")
@@ -193,12 +206,17 @@ def command_train(args, manifest_hash):
         data_path = args.output / "smoke_input.jsonl"
         write_rows(data_path, expected)
     options = train_args(args, data_path, steps, lr, args.anchor, args.output)
+    if class_balance is not None:
+        options.extend(["--diagnosis-class-weights", json.dumps(class_balance["weights"], sort_keys=True),
+                        "--checkpoint-steps", "5"])
     config = {"manifest_sha256": manifest_hash, "arm": args.arm, "smoke": args.smoke,
               "screen": args.steps is not None, "rows": len(expected), "requested_steps": steps,
               "initial_adapter": anchor_id, "learning_rate": lr, "data_sha256": digest(data_path),
               "teacher_report_sha256": digest(args.teacher_report) if args.teacher_report else None,
               "base_pin_sha256": digest(args.pin), "argv": options,
               "environment": source_config(), "gpu": torch.cuda.get_device_name()}
+    if class_balance is not None:
+        config["diagnosis_class_balance"] = class_balance
     write_json(args.output / "run_config.json", config)
 
     def checked(rows, _):
@@ -217,6 +235,8 @@ def command_train(args, manifest_hash):
     if (summary["data_sha256"] != config["data_sha256"] or summary["learning_rate"] != lr
             or summary["rows"] != len(expected)):
         raise ValueError("Trainer summary differs from the run configuration")
+    if class_balance is not None and summary["diagnosis_class_weights"] != class_balance["weights"]:
+        raise ValueError("Trainer class weights differ from the run configuration")
     check_update(args.output, args.anchor)
     effective_steps = (summary["teacher_context"]["optimizer_steps"] if args.arm == "opsd"
                        else summary["optimizer_steps"])
@@ -373,6 +393,8 @@ def main(argv=None):
     training.add_argument("--accumulation", type=int, default=4)
     training.add_argument("--steps", type=int)
     training.add_argument("--smoke", action="store_true")
+    training.add_argument("--balance-diagnosis-classes", action="store_true",
+                          help="Apply inverse square-root class weighting to memory-first SFT")
     evaluation = modes.add_parser("evaluate")
     evaluation.add_argument("--model", type=Path, required=True)
     evaluation.add_argument("--pin", type=Path, required=True)

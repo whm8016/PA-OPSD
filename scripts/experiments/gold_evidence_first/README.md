@@ -52,6 +52,17 @@ gold train opsd --model "$MODEL" --pin base_model.json --anchor "$ANCHOR" --lear
 
 训练目录保存真实命令、代码与数据哈希、软件版本、原始日志、学习率和梯度、有效步数、计入损失的 token 及前后权重变化。评测目录保存逐题原文及终止原因、四类诊断及召回、策略匹配、Q1–Q3 精确匹配和反馈字符重合。这里是同一入口的离线对照。正式教学质量仍需复用 LongTutor 裁判协议另评。
 
+## 诊断类别加权 SFT
+
+从原基座开始，沿用 `memory_first` 的 420 道训练题、105 步、`2e-5`、LoRA 设置和输入输出结构。`--balance-diagnosis-classes` 按类别频数的平方根倒数为每条样本的完整答复损失加权，并使样本平均权重为 1。试跑的权重也由完整训练集计算。运行配置和训练摘要记录类别权重，训练每 5 步保存检查点。
+
+```bash
+gold train memory_first --model "$MODEL" --pin base_model.json --output runs/balanced_smoke --smoke --balance-diagnosis-classes
+gold train memory_first --model "$MODEL" --pin base_model.json --output runs/balanced_sft --balance-diagnosis-classes
+```
+
+正式评测将新适配器接入 LongTutor 原始推理入口，用固定开发集 140 道和相同的 DK 裁判评分。沿用已有基座结果。 [评测入口](../longtutor_reeval/README.md) · [本轮指标](../../../docs/LongTutor官方复评_基座与SFT.md#类别加权-sft-对比基座)
+
 ## 一条虚构样例
 
 学生可见输入是“上周做对两道通分题。今天把分母改成 12，分子忘了乘。请回答三道历史问题并给出诊断和提示”。教师额外看到“这道题的标准解需要分子、分母同乘 3”，历史和问题保持相同。SFT 目标先回答 `memory`，再写 `diagnosis`、`reason`、`strategy` 和 `content`。SFT 只在助手答案 token 上计算损失。OPSD 先由学生生成回答，教师在保留相同生成前缀的情况下提供分布监督。
