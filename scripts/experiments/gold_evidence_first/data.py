@@ -202,9 +202,10 @@ def verify(bundle):
     return manifest
 
 
-def teacher_prompts(bundle):
+def teacher_prompts(bundle, teacher_context=None):
     rows = read_jsonl(bundle / DEV_PROMPTS)
     solutions = load_standard_solutions(rows, bundle / BANK)
     return [{**row, "messages": standard_solution_messages(
-        row["messages"], solutions[row["sample_id"]], include_guidance=False)}
+        teacher_context(row["messages"])[0] if teacher_context else row["messages"],
+        solutions[row["sample_id"]], include_guidance=False)}
             for row in rows]

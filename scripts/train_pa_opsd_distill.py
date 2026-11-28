@@ -1,4 +1,4 @@
-"""Local same-model privileged-context PA-OPSD distillation (not API logits)."""
+"""Local on-policy distillation with a privileged or frozen teacher."""
 
 import argparse
 import json
@@ -48,6 +48,14 @@ def weight_precision(precision, is_adapter):
     return 'float32' if precision == 'float16' and not is_adapter else precision
 
 
+def check_frozen_tokenizer(student, teacher):
+    boundaries = ('bos_token_id', 'eos_token_id', 'pad_token_id')
+    if (teacher.get_vocab() != student.get_vocab()
+            or any(getattr(teacher, name) != getattr(student, name) for name in boundaries)
+            or teacher.chat_template != student.chat_template):
+        raise ValueError('Frozen teacher and student must share vocabulary IDs and the chat template')
+
+
 def save_training_metadata(options, precision, rows, metrics, *, standard_solution_context=None,
                            rollout_validation=None, optimizer_log=None):
     summary = {'stage': 'opsd', 'rows': rows, 'model': str(options.sft_checkpoint),
@@ -73,7 +81,7 @@ def save_training_metadata(options, precision, rows, metrics, *, standard_soluti
         json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def main(argv=None, *, validate_manifest=None, gold_run=False):
+def main(argv=None, *, validate_manifest=None, gold_run=False, teacher_context=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-jsonl", required=True)
     parser.add_argument("--seed-manifest", type=Path,
@@ -104,6 +112,7 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
                             help='Use only the current problem answer and analysis from the official XES3G5M bank')
         parser.add_argument('--solution-only-addendum', action='store_true',
                             help='Append only the standard solution, without teacher-specific instructions')
+        parser.add_argument('--frozen-teacher', type=Path, help='Local frozen teacher weights for the Gold GKD arm')
     options = parser.parse_args(argv)
     if options.checkpoint_steps is not None and options.checkpoint_steps < 1:
         parser.error('--checkpoint-steps must be positive')
@@ -115,6 +124,9 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
     solution_only = gold_run and options.solution_only_addendum
     if solution_only and bank is None:
         parser.error('--solution-only-addendum requires --standard-solution-bank')
+    frozen_path = options.frozen_teacher if gold_run else None
+    if (frozen_path is not None or teacher_context is not None) and bank is None:
+        parser.error('Gold teacher variants require --standard-solution-bank')
     solutions, bank_hash = None, None
     if bank is not None:
         from pa_opsd_collator import load_standard_solutions
@@ -179,6 +191,8 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
         model_options.update(quantization_config=BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type='nf4', bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=dtype), device_map={'': torch.cuda.current_device()})
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     tokenizer = AutoTokenizer.from_pretrained(str(checkpoint), padding_side="left", local_files_only=True)
     if tokenizer.eos_token_id is None:
@@ -187,11 +201,20 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
         tokenizer.pad_token = tokenizer.eos_token
     collator = PAOPSDDataCollator(tokenizer, options.max_length, options.max_completion_length,
                                  standard_solutions=solutions, strict_output_prompt=options.strict_output_prompt,
-                                 standard_solution_guidance=not solution_only)
+                                 standard_solution_guidance=not solution_only, teacher_context=teacher_context)
+    if frozen_path is not None:
+        frozen_tokenizer = AutoTokenizer.from_pretrained(str(frozen_path), local_files_only=True)
+        check_frozen_tokenizer(tokenizer, frozen_tokenizer)
     # Check every prompt budget before starting any optimizer step.
     for row in rows:
-        for messages in collator.prompt_messages(row):
-            collator.encode_prompt(messages)
+        student_messages, teacher_messages = collator.prompt_messages(row)
+        collator.encode_prompt(student_messages)
+        teacher_ids = collator.encode_prompt(teacher_messages)
+        if frozen_path is not None:
+            text = frozen_tokenizer.apply_chat_template(
+                teacher_messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            if frozen_tokenizer(text, add_special_tokens=False)["input_ids"] != teacher_ids:
+                raise ValueError(f"Frozen teacher tokenizes the prompt differently: {row['sample_id']}")
     control_options = {"save_strategy": "no", "logging_steps": 1, "disable_dropout": False} if gold_run else {}
     if options.checkpoint_steps is not None:
         control_options.update(save_strategy="steps", save_steps=options.checkpoint_steps, save_total_limit=2)
@@ -239,6 +262,20 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
             raise ValueError('4-bit distillation requires a trainable PEFT adapter checkpoint')
         args.model_init_kwargs = model_options
     args.presence_penalty = 0.0
+    frozen_teacher = None
+    if frozen_path is not None:
+        from transformers import AutoModelForCausalLM
+
+        frozen_teacher = AutoModelForCausalLM.from_pretrained(str(frozen_path), **model_options)
+        if frozen_teacher.config.vocab_size != model.config.vocab_size:
+            raise ValueError('Frozen teacher and student vocabulary logits have different widths')
+        if not options.load_in_4bit:
+            frozen_teacher.to(torch.device('cuda', torch.cuda.current_device())
+                              if torch.cuda.is_available() else torch.device('cpu'))
+        frozen_teacher.requires_grad_(False).eval()
+        solution_context['mode'] = 'frozen_teacher_standard_solution'
+    elif teacher_context is not None:
+        solution_context['mode'] = 'compact_history_standard_solution'
     # TRL may cast a k-bit adapter to BF16 while constructing SFTTrainer.
     # Preserve the SFT checkpoint's FP32 masters for the small matched learning rate.
     masters = ({name: parameter.detach().clone() for name, parameter in model.named_parameters()
@@ -249,6 +286,7 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
         reason_first=False, fixed_teacher=False, use_ema_teacher=False,
         student_thinking=False, teacher_thinking=False,
         validate_pa_rollouts=options.validate_rollouts,
+        frozen_teacher_model=frozen_teacher,
     )
     if masters:
         for name, parameter in trainer.model.named_parameters():
@@ -256,8 +294,10 @@ def main(argv=None, *, validate_manifest=None, gold_run=False):
                 parameter.data = masters.pop(name).to(device=parameter.device)
         if masters:
             raise ValueError("TRL changed the trainable adapter parameters")
-    print("Teacher mode: local-same-model-privileged; no API teacher logits; teacher forward is stop-gradient")
+    print(f"Teacher mode: {'frozen local model' if frozen_teacher is not None else options.teacher_mode}; "
+          "teacher forward is stop-gradient")
     result = trainer.train()
+    result.metrics['peak_allocated_bytes'] = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None
     trainer._save_generation_outputs(result.global_step)
     effective_steps = result.global_step
     rollout_validation = None

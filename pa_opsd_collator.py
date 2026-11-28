@@ -90,7 +90,8 @@ def validate_distill_row(row):
 
 class PAOPSDDataCollator:
     def __init__(self, tokenizer, max_length=2048, max_completion_length=256, reason_first=False, *,
-                 standard_solutions=None, strict_output_prompt=False, standard_solution_guidance=True):
+                 standard_solutions=None, strict_output_prompt=False, standard_solution_guidance=True,
+                 teacher_context=None):
         if reason_first:
             raise ValueError("PA-OPSD v1 supports reason_first=False only")
         if max_length <= max_completion_length or max_completion_length < 1:
@@ -103,6 +104,7 @@ class PAOPSDDataCollator:
         self.standard_solutions = standard_solutions
         self.standard_solution_guidance = standard_solution_guidance
         self.strict_output_prompt = strict_output_prompt
+        self.teacher_context = teacher_context
 
     def prompt_messages(self, row):
         validate_distill_row(row)
@@ -113,8 +115,9 @@ class PAOPSDDataCollator:
             student = strict_output_messages(student)
         if self.standard_solutions is not None:
             reference = self.standard_solutions[row["sample_id"]]
+            context = self.teacher_context(student)[0] if self.teacher_context else student
             return student, standard_solution_messages(
-                student, reference, include_guidance=self.standard_solution_guidance)
+                context, reference, include_guidance=self.standard_solution_guidance)
         teacher = student + [{
             "role": "user",
             "content": "Teacher-only privileged context (not student-visible):\n"

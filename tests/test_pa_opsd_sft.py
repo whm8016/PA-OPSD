@@ -337,8 +337,33 @@ class SFTTests(unittest.TestCase):
         expected.backward()
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(actual_grad, model.lm_head.weight.grad, rtol=1e-4, atol=1e-6)
+        model.zero_grad(set_to_none=True)
+        token_weights = torch.tensor([[1, 1, 1, 1, 8, 1], [1, 1, 3, 1, 1, 1]], dtype=torch.float32)
+        actual, _ = assistant_token_loss(model, {**inputs, "token_weights": token_weights}, num_items_in_batch=8)
+        actual.backward()
+        actual_grad = model.lm_head.weight.grad.clone()
+        model.zero_grad(set_to_none=True)
+        logits = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"]).logits
+        per_token = torch.nn.functional.cross_entropy(logits[:, :-1].transpose(1, 2), inputs["labels"][:, 1:],
+                                                      ignore_index=-100, reduction="none")
+        expected = (per_token * token_weights[:, 1:]).sum() / 8
+        expected.backward()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, model.lm_head.weight.grad, rtol=1e-4, atol=1e-6)
         with self.assertRaisesRegex(ValueError, "supervised assistant"):
             assistant_token_loss(model, {**inputs, "labels": torch.full_like(inputs["labels"], -100)})
+
+    def test_diagnosis_span_ignores_the_same_word_in_memory_reason_or_content(self):
+        from scripts.train_pa_opsd_sft import diagnosis_span
+
+        label = "Recall Failure"
+        content = json.dumps({"memory": [{"diagnosis": label}], "reason": label,
+                              "diagnosis": label, "content": label}, indent=2)
+        start, end = diagnosis_span(content)
+        self.assertEqual(content[start:end], label)
+        self.assertEqual(start, content.rfind('"diagnosis": "') + len('"diagnosis": "'))
+        with self.assertRaisesRegex(ValueError, "single unescaped JSON string"):
+            diagnosis_span('{"diagnosis":"First", "diagnosis":"Second"}')
 
     @unittest.skipUnless(importlib.util.find_spec("torch") and importlib.util.find_spec("transformers"),
                          "torch/transformers unavailable; no local gradient test")

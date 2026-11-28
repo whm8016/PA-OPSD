@@ -186,6 +186,7 @@ class OPSDTrainer(SFTTrainer):
         student_thinking: bool = False,
         teacher_thinking: bool = True,
         validate_pa_rollouts: bool = False,
+        frozen_teacher_model: nn.Module | None = None,
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
@@ -227,6 +228,7 @@ class OPSDTrainer(SFTTrainer):
         self.seq_kd = args.seq_kd
         self.use_thinking_machines_loss = use_thinking_machines_loss
         self.fixed_teacher = fixed_teacher
+        self.frozen_teacher_model = frozen_teacher_model
         self.reason_first = reason_first
         self.top_k_loss = top_k_loss
         self.jsd_token_clip = jsd_token_clip
@@ -245,6 +247,9 @@ class OPSDTrainer(SFTTrainer):
             raise ValueError(
                 "use_ema_teacher=True and fixed_teacher=True are mutually exclusive teacher strategies."
             )
+
+        if frozen_teacher_model is not None and (fixed_teacher or use_ema_teacher or reason_first):
+            raise ValueError("An external frozen teacher requires ordinary teacher forwards")
 
         if self.use_ema_teacher:
             self.add_callback(EMAUpdateCallback(self))
@@ -743,7 +748,8 @@ class OPSDTrainer(SFTTrainer):
             adapter_context = nullcontext()
 
         with torch.no_grad(), adapter_context:
-            outputs_teacher = model(
+            teacher_model = self.frozen_teacher_model if self.frozen_teacher_model is not None else model
+            outputs_teacher = teacher_model(
                 input_ids=inputs["teacher_input_ids"],
                 attention_mask=inputs["teacher_attention_mask"],
                 **teacher_options,

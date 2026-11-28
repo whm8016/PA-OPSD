@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -88,7 +89,31 @@ def validate_row(row):
     return clean
 
 
-def encode_row(row, tokenizer, max_length):
+def diagnosis_span(content):
+    """Find the top-level JSON diagnosis string, without picking up quoted text in another field."""
+    decoder = json.JSONDecoder()
+    field = re.compile(r'\s*:\s*')
+    next_field = re.compile(r'\s*,\s*')
+    start = re.match(r'\s*\{\s*', content).end()
+    span = None
+    while True:
+        key, end = decoder.raw_decode(content, start)
+        start = field.match(content, end).end()
+        value, end = decoder.raw_decode(content, start)
+        if key == "diagnosis":
+            if span is not None or not isinstance(value, str) or content[start + 1:end - 1] != value:
+                raise ValueError("diagnosis must be a single unescaped JSON string")
+            span = start + 1, end - 1
+        following = next_field.match(content, end)
+        if not following:
+            break
+        start = following.end()
+    if span is None:
+        raise ValueError("No top-level diagnosis value")
+    return span
+
+
+def encode_row(row, tokenizer, max_length, *, diagnosis_weight=None):
     if max_length < 2:
         raise ValueError("max_length must be at least 2")
     messages = validate_row(row)
@@ -101,18 +126,31 @@ def encode_row(row, tokenizer, max_length):
     if not full.startswith(prompt) or not full[len(prompt):].startswith(messages[-1]["content"]):
         raise ValueError("chat template is not an exact assistant continuation prefix")
     prompt_ids = tokenizer(prompt, add_special_tokens=False, truncation=False)["input_ids"]
-    full_ids = tokenizer(full, add_special_tokens=False, truncation=False)["input_ids"]
+    offsets = {"return_offsets_mapping": True} if diagnosis_weight is not None else {}
+    full_encoding = tokenizer(full, add_special_tokens=False, truncation=False, **offsets)
+    full_ids = full_encoding["input_ids"]
     if full_ids[:len(prompt_ids)] != prompt_ids or len(full_ids) <= len(prompt_ids):
         raise ValueError("tokenized chat template prefix mismatch or empty assistant")
     if len(full_ids) > max_length:
         raise OverlengthError(
             f"sample {row['sample_id']}: {len(full_ids)} tokens exceed max_length={max_length}; no truncation"
         )
-    return {
+    result = {
         "input_ids": full_ids,
         "attention_mask": [1] * len(full_ids),
         "labels": [-100] * len(prompt_ids) + full_ids[len(prompt_ids):],
     }
+    if diagnosis_weight is not None:
+        start, end = diagnosis_span(messages[-1]["content"])
+        start += len(prompt)
+        end += len(prompt)
+        mask = [left < end and right > start and right > left for left, right in full_encoding["offset_mapping"]]
+        covered = [bounds for bounds, selected in zip(full_encoding["offset_mapping"], mask, strict=True) if selected]
+        if (not covered or any(mask[:len(prompt_ids)]) or covered[0][0] > start or covered[-1][1] < end
+                or full[covered[0][0]:start].strip() or full[end:covered[-1][1]].strip()):
+            raise ValueError("Diagnosis label is not covered by a clean assistant token span")
+        result["token_weights"] = [diagnosis_weight if selected else 1.0 for selected in mask]
+    return result
 
 
 def pad_examples(examples, pad_token_id):
@@ -140,6 +178,12 @@ class AssistantCollator:
         if "sample_weight" in examples[0]:
             batch["sample_weight"] = torch.tensor([item["sample_weight"] for item in examples],
                                                   dtype=torch.float32)
+        if "token_weights" in examples[0]:
+            width = batch["labels"].shape[1]
+            batch["token_weights"] = torch.tensor(
+                [item["token_weights"] + [1.0] * (width - len(item["token_weights"])) for item in examples],
+                dtype=torch.float32,
+            )
         return batch
 
 
@@ -158,7 +202,8 @@ def read_rows(path):
     return rows
 
 
-def prepare_rows(rows, tokenizer, max_length, split="train", audit=False, *, class_weights=None):
+def prepare_rows(rows, tokenizer, max_length, split="train", audit=False, *, class_weights=None,
+                 diagnosis_token_multiplier=None):
     features = []
     report = {"total_rows": len(rows), "selected_rows": 0, "usable_rows": 0,
               "invalid_rows": 0, "overlength_rows": 0, "supervised_tokens": 0,
@@ -174,12 +219,17 @@ def prepare_rows(rows, tokenizer, max_length, split="train", audit=False, *, cla
             seen.add(row["sample_id"])
             if row["split"] != split:
                 continue
-            encoded = encode_row(row, tokenizer, max_length)
+            weight = None
             if class_weights is not None:
                 label = json.loads(row["messages"][-1]["content"])["diagnosis"]
                 if label not in class_weights:
                     raise ValueError(f"missing SFT class weight for {label!r}")
-                encoded["sample_weight"] = class_weights[label]
+                weight = class_weights[label]
+            encoded = encode_row(row, tokenizer, max_length, diagnosis_weight=(
+                weight * diagnosis_token_multiplier if diagnosis_token_multiplier is not None else None
+            ))
+            if weight is not None and diagnosis_token_multiplier is None:
+                encoded["sample_weight"] = weight
         except (ValueError, TypeError) as exc:
             category = "overlength_rows" if isinstance(exc, OverlengthError) else "invalid_rows"
             report[category] += 1
@@ -192,6 +242,8 @@ def prepare_rows(rows, tokenizer, max_length, split="train", audit=False, *, cla
     report["usable_rows"] = len(features)
     if report["selected_rows"]:
         report["coverage"] = len(features) / report["selected_rows"]
+    if diagnosis_token_multiplier is not None:
+        report["reweighted_tokens"] = sum(sum(weight != 1.0 for weight in row['token_weights']) for row in features)
     if not audit and not features:
         raise ValueError(f"no usable {split} rows")
     return features, report
@@ -223,11 +275,14 @@ def assistant_token_loss(model, inputs, num_items_in_batch=None, offload_saved_t
         outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
                         logits_to_keep=positions, use_cache=False)
     sample_weight = inputs.get("sample_weight")
+    token_weights = inputs.get("token_weights")
     loss = F.cross_entropy(outputs.logits.float().reshape(-1, outputs.logits.shape[-1]),
                            targets.reshape(-1), ignore_index=-100,
-                           reduction="none" if sample_weight is not None else "sum")
+                           reduction="none" if sample_weight is not None or token_weights is not None else "sum")
     if sample_weight is not None:
         loss = (loss.reshape_as(targets).sum(dim=1) * sample_weight).sum()
+    if token_weights is not None:
+        loss = (loss.reshape_as(targets) * token_weights[:, 1:][:, positions]).sum()
     denominator = targets.ne(-100).sum() if num_items_in_batch is None else num_items_in_batch
     return loss / denominator, outputs
 
@@ -325,6 +380,11 @@ def train(args, tokenizer, features):
         summary["supervised_tokens_seen"] = trainer.supervised_tokens_seen
     if class_weights is not None:
         summary["diagnosis_class_weights"] = class_weights
+    if args.diagnosis_token_multiplier is not None:
+        summary["diagnosis_token_multiplier"] = args.diagnosis_token_multiplier
+        summary["reweighted_tokens_in_dataset"] = sum(
+            sum(weight != 1.0 for weight in row['token_weights']) for row in features
+        )
     from hashlib import sha256
 
     summary['source_sha256'] = sha256(Path(__file__).read_bytes()).hexdigest()
@@ -525,6 +585,8 @@ def main(argv=None, *, validate_manifest=None, load_inference=None):
                         help="Compute vocabulary logits only at supervised positions; requires model logits_to_keep support")
     parser.add_argument("--diagnosis-class-weights",
                         help="JSON object mapping diagnosis labels to positive SFT sample loss weights")
+    parser.add_argument("--diagnosis-token-multiplier", type=float,
+                        help="Apply class weights times this multiplier only to the diagnosis label tokens")
     parser.add_argument("--offload-saved-tensors", action="store_true",
                         help="Store saved forward tensors on CPU; requires --assistant-logits-only")
     parser.add_argument("--attn-implementation", default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
@@ -553,6 +615,11 @@ def main(argv=None, *, validate_manifest=None, load_inference=None):
         ):
             parser.error("--diagnosis-class-weights must map labels to positive normal float32 numbers")
         args.diagnosis_class_weights = weights
+    if args.diagnosis_token_multiplier is not None:
+        multiplier = args.diagnosis_token_multiplier
+        if (weights is None or not 1.0 <= multiplier <= 3.40282346e38
+                or max(weights.values()) * multiplier > 3.40282346e38):
+            parser.error("--diagnosis-token-multiplier requires --diagnosis-class-weights and finite float32 weights")
     if args.checkpoint_steps is not None and (args.command != "train" or args.checkpoint_steps < 1):
         parser.error("--checkpoint-steps requires train and a positive interval")
     if args.strict_output_prompt and args.command != "generate":
@@ -579,7 +646,8 @@ def main(argv=None, *, validate_manifest=None, load_inference=None):
         (validate_manifest or validate_against_seed_manifest)(rows, args.seed_manifest)
         tokenizer = load_tokenizer(args.model, args.local_files_only)
         features, report = prepare_rows(rows, tokenizer, args.max_length, args.split,
-                                        audit=args.command == "audit", class_weights=weights)
+                                        audit=args.command == "audit", class_weights=weights,
+                                        diagnosis_token_multiplier=args.diagnosis_token_multiplier)
         print(json.dumps(report, ensure_ascii=False))
         if args.command == "audit":
             return 1 if report["invalid_rows"] or report['overlength_rows'] or not report["usable_rows"] else 0

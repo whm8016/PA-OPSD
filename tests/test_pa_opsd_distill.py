@@ -475,7 +475,7 @@ class TensorTests(unittest.TestCase):
         exec(compile(ast.Module(body=methods, type_ignores=[]), "opsd_loss_extracted", "exec"), namespace)  # noqa: S102 - trusted local trainer methods, no external input
         harness = types.SimpleNamespace(use_thinking_machines_loss=False, temperature=1.0,
                                         use_ema_teacher=False, fixed_teacher=False, beta=0.5,
-                                        top_k_loss=None, jsd_token_clip=None)
+                                        top_k_loss=None, jsd_token_clip=None, frozen_teacher_model=None)
         harness.generalized_jsd_loss = namespace["generalized_jsd_loss"]
         class Tiny(torch.nn.Module):
             def __init__(self):
@@ -499,6 +499,17 @@ class TensorTests(unittest.TestCase):
         self.assertEqual([flag for flag, _ in model.calls], [True, False])
         self.assertFalse(model.calls[1][1].requires_grad)
         self.assertIsNotNone(model.embedding.weight.grad)
+        self.assertGreater(model.embedding.weight.grad.abs().sum().item(), 0)
+
+        frozen = Tiny().requires_grad_(False).eval()
+        harness.frozen_teacher_model = frozen
+        model.calls.clear()
+        model.zero_grad(set_to_none=True)
+        loss = namespace["compute_loss"](harness, model, inputs)
+        loss.backward()
+        self.assertEqual([flag for flag, _ in model.calls], [True])
+        self.assertEqual([flag for flag, _ in frozen.calls], [False])
+        self.assertIsNone(frozen.embedding.weight.grad)
         self.assertGreater(model.embedding.weight.grad.abs().sum().item(), 0)
 
     def test_pa_opsd_rollout_uses_autocast_eval_and_restores_training(self):

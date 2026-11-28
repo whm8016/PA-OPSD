@@ -2,11 +2,11 @@
 
 ## 当前实验与仓库准备
 
-11 月 23 日的实验使用 420 条训练新顺序 SFT，再在 140 条开发题上比较基座和新顺序 SFT。证据语义及教学反馈尚未用裁判模型评分。以下旧顺序和二阶段入口用于后续研究，当前结果只包含基座与新顺序 SFT。
+11 月 23 日的实验使用 420 条训练新顺序 SFT，再在 140 条开发题上比较基座和新顺序 SFT。证据语义及教学反馈已完成官方复评。 [基座与新顺序 SFT 结果](../../../docs/PA-OPSD近期进展与下一轮方案.md#longtutor-官方复评--基座与现有-sft)
 
 代码依赖 [LongTutor](https://github.com/liano3/LongTutor) 官方仓库的脚本和 XES3G5M 数据，放在 `data/longtutor/repo/` 并检出提交 `ba40af3b9e976f5960c42a15a645c0e9c3a7d718`。固定 Gold 划分、派生输入包、模型权重和评测输出不随本仓库提供，运行前需要在本地准备。原始划分默认位于 `outputs/pa_opsd/gold_split_20261120/`，模型校验文件默认为该目录下 `pa_opsd_gold_20261120/base_model.json`。
 
-已完成的 11 月 23 日重启训练使用的 `train_pa_opsd_sft.py` 与当前源码有一处运行设置差异，该次每 5 步保存检查点并保留最近 2 个，当前源码关闭中途检查点保存。两者训练目标和训练超参数一致。该次配置和结果保存在本地实验输出中。
+11 月 23 日重启训练每 5 步保存检查点并保留最近 2 个。以下加权对照复用该保存间隔。
 
 这个入口验证三个问题：在 SFT 目标中先输出历史答案是否改善诊断，标准解能否提供诊断监督，以及续训学习率和 OPSD 是否带来可复现的收益。原 Gold 数据和检查点继续用于历史复核。
 
@@ -52,16 +52,37 @@ gold train opsd --model "$MODEL" --pin base_model.json --anchor "$ANCHOR" --lear
 
 训练目录保存真实命令、代码与数据哈希、软件版本、原始日志、学习率和梯度、有效步数、计入损失的 token 及前后权重变化。评测目录保存逐题原文及终止原因、四类诊断及召回、策略匹配、Q1–Q3 精确匹配和反馈字符重合。这里是同一入口的离线对照。正式教学质量仍需复用 LongTutor 裁判协议另评。
 
-## 诊断类别加权 SFT
+## 诊断类别加权对照
 
-从原基座开始，沿用 `memory_first` 的 420 道训练题、105 步、`2e-5`、LoRA 设置和输入输出结构。`--balance-diagnosis-classes` 按类别频数的平方根倒数为每条样本的完整答复损失加权，并使样本平均权重为 1。试跑的权重也由完整训练集计算。运行配置和训练摘要记录类别权重，训练每 5 步保存检查点。
+在同一个已校验的输入包上从基座训练，使用 `memory_first` 训练数据中的全部 420 道。`--balance-diagnosis-classes` 用各类题数的平方根倒数给每条样本的答案损失加权，并使样本平均权重为 1。类别只从训练目标的 `diagnosis` 读取。一次设置保留 105 步、`2e-5`、批大小 1、累积 4、LoRA 配置、训练输入及输出格式。运行配置和训练摘要记录类别权重，原入口省略该选项即可复现未加权目标。
 
 ```bash
 gold train memory_first --model "$MODEL" --pin base_model.json --output runs/balanced_smoke --smoke --balance-diagnosis-classes
 gold train memory_first --model "$MODEL" --pin base_model.json --output runs/balanced_sft --balance-diagnosis-classes
 ```
 
-正式评测将新适配器接入 LongTutor 原始推理入口，用固定开发集 140 道和相同的 DK 裁判评分。沿用已有基座结果。 [评测入口](../longtutor_reeval/README.md) · [本轮指标](../../../docs/LongTutor官方复评_基座与SFT.md#类别加权-sft-对比基座)
+试跑取最长的 4 条，权重同样从全量训练集计算。正式训练结束后，将新适配器接入原始 LongTutor 推理和评分脚本。固定开发集 140 道、BF16 和同一 DK 裁判，复用现有基座与未加权 SFT 的逐题结果。主看诊断 Macro-F1 和各类命中，同时核对证据与教学。 [官方复评入口](../longtutor_reeval/README.md)
+
+## 并行二阶段训练
+
+| 入口 | 教师输入和更新方式 |
+| --- | --- |
+| `sft_cont` | 同一起点上的 Gold SFT 续训。 |
+| `opsd` | 同源教师读全历史和题库标准解。 |
+| `opsd_compact` | 同源教师读取精简历史、全历史统计和同一份标准解。按可见的题号和单日日期保留所有匹配记录。记忆题的范围不明确时，教师使用全历史。学生提示保持完整。 |
+| `gkd_frozen` | 冻结的同词表 Qwen2.5-14B-Instruct 教师读全历史和标准解。校验本地权重、词表、特殊边界 token、提示分词和 logits 维度。教师前向无梯度。 |
+
+在 `opd_variants/gpu_stage2.zip` 解压出的包根目录执行。各实例使用同一份包并各自运行一个分组，指定新的结果目录。`OPD_PYTHON` 为本地训练环境的解释器路径，`OPD_STUDENT_MODEL` 默认为原 SFT 训练时记录的基座路径。D 组还需设 `OPD_FROZEN_TEACHER`，路径指向 `teacher_14b.json` 固定版本的模型。
+
+```bash
+export OPD_PYTHON=/path/to/venv/bin/python
+bash scripts/experiments/gold_evidence_first/run_stage2.sh sft_cont runs/sft_cont
+bash scripts/experiments/gold_evidence_first/run_stage2.sh opsd runs/opsd
+bash scripts/experiments/gold_evidence_first/run_stage2.sh opsd_compact runs/opsd_compact
+bash scripts/experiments/gold_evidence_first/run_stage2.sh gkd_frozen runs/gkd_frozen
+```
+
+启动脚本默认统一用 `5e-6`。蒸馏组先预检教师，复用已保存的新 SFT 学生输出并重验逐题提示哈希。C 组额外在固定 Gold 24 上保存覆盖和回退情况。完成教师预检后在各组最长的 4 道训练题上试跑一个窗口，随后进行 35 个更新窗口和 140 道开发题评测。独立教师结果许可及有效更新数写进收据。显存、有效步数、离线质量评分待 GPU 运行验证。
 
 ## 一条虚构样例
 

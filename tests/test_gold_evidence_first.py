@@ -11,6 +11,7 @@ from scripts.experiments.gold_evidence_first.data import (
 )
 from scripts.experiments.gold_evidence_first.metrics import paired
 from scripts.experiments.gold_evidence_first.run import check_teacher_report
+from scripts.experiments.gold_evidence_first.teacher_context import compact_history
 
 
 class GoldEvidenceFirstTests(unittest.TestCase):
@@ -53,10 +54,37 @@ class GoldEvidenceFirstTests(unittest.TestCase):
             path.write_text(json.dumps(report), encoding="utf-8")
             check_teacher_report(path, "bundle", "anchor")
             with self.assertRaises(ValueError):
+                check_teacher_report(path, "bundle", "anchor", "opsd_compact")
+            path.write_text(json.dumps({**report, "teacher_arm": "gkd_frozen", "teacher_pin_sha256": "x"}),
+                            encoding="utf-8")
+            check_teacher_report(path, "bundle", "anchor", "gkd_frozen", "x")
+            with self.assertRaises(ValueError):
+                check_teacher_report(path, "bundle", "anchor", "gkd_frozen", "y")
+            with self.assertRaises(ValueError):
                 check_teacher_report(path, "bundle", "another_anchor")
             path.write_text(json.dumps({**report, "smoke": True}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 check_teacher_report(path, "bundle", "anchor")
+
+    def test_compact_teacher_preserves_all_date_records_and_ambiguous_scope_falls_back(self):
+        records = [f"[{qid}]\nexercise\n知识点: topic{qid}\n时间: 2021-05-{day:02}T00:00:00\n结果: 正确"
+                   for qid, day in enumerate([1, 1, *range(2, 16)], 1)]
+        prompt = ("### INTERACTION HISTORY\n" + "\n\n".join(records)
+                  + "\n\n### CURRENT QUESTION\n[99]\ncurrent\n知识点: new\n时间: 2021-05-16T00:00:00"
+                  + "\n\n### MEMORY QUERIES\n- Q1: 记录[1]提到了什么？\n- Q2: 2021年5月1日有几道？\n"
+                  "- Q3: 2021-05-02 有错误吗？")
+        student = [{"role": "system", "content": "task"}, {"role": "user", "content": prompt}]
+        teacher, audit = compact_history(student)
+        self.assertFalse(audit["fallback"])
+        self.assertEqual(audit["memory_positions"], [1, 2, 3])
+        self.assertEqual(student[1]["content"], prompt)
+        self.assertIn(records[1], teacher[1]["content"])
+        self.assertNotIn(records[4], teacher[1]["content"])
+        self.assertEqual(teacher[1]["content"].split("### CURRENT QUESTION")[1],
+                         prompt.split("### CURRENT QUESTION")[1])
+        for ambiguous in ("最近", "[1]到[16]", "（如[1]）", "[1]等"):
+            unknown = [student[0], {**student[1], "content": prompt.replace("2021-05-02", ambiguous)}]
+            self.assertEqual(compact_history(unknown), (unknown, {"fallback": True, "history_records": 16}))
 
     def test_score_pairs_require_the_same_reference(self):
         left = [{"sample_id": "q1", "diagnosis_gold": "Recall Failure", "diagnosis": None}]
